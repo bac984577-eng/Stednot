@@ -1,0 +1,210 @@
+name: Build Najma APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Prepare Android SDK (preinstalled on runner)
+        run: |
+          SDKM=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -1)
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-34" "build-tools;34.0.0" || true
+
+      - name: Write app (index.html)
+        run: |
+          mkdir -p www
+          gunzip -c najma-app.html.gz > www/index.html
+
+      - name: Create Capacitor project
+        run: |
+          npm init -y
+          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 @capacitor/filesystem@6 @capacitor/share@6 @capacitor/app@6
+          npx cap init "studNot" com.najma.notes --web-dir=www
+          npx cap add android
+          npm install pdfjs-dist@3.11.174 --omit=optional
+          mkdir -p www/pdfjs
+          cp node_modules/pdfjs-dist/build/pdf.min.js node_modules/pdfjs-dist/build/pdf.worker.min.js www/pdfjs/
+          npx cap sync android
+
+      - name: Set studNot app icon
+        run: |
+          R=android/app/src/main/res
+          tar -xzf "$GITHUB_WORKSPACE/najma-icons.tgz" -C "$R"
+          printf '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">#FFFFFF</color>\n</resources>\n' > "$R/values/ic_launcher_background.xml"
+          sed -i 's#<string name="app_name">[^<]*</string>#<string name="app_name">studNot</string>#; s#<string name="title_activity_main">[^<]*</string>#<string name="title_activity_main">studNot</string>#' "$R/values/strings.xml"
+          cat "$R/values/strings.xml"
+          ls "$R"/mipmap-*
+
+      - name: Add home-screen shortcut plugin
+        run: |
+          D=android/app/src/main/java/com/najma/notes
+          mkdir -p "$D"
+          cat > "$D/ShortcutPlugin.java" <<'JAVA_EOF'
+          package com.najma.notes;
+
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.ShortcutInfo;
+          import android.content.pm.ShortcutManager;
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Paint;
+          import android.graphics.RectF;
+          import android.graphics.drawable.Icon;
+          import android.os.Build;
+          import android.text.Layout;
+          import android.text.StaticLayout;
+          import android.text.TextPaint;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          @CapacitorPlugin(name = "Shortcut")
+          public class ShortcutPlugin extends Plugin {
+            @PluginMethod
+            public void pin(PluginCall call) {
+              String id = call.getString("id", "");
+              String title = call.getString("title", "Note").trim();
+              if (title.isEmpty()) title = "Note";
+              int color;
+              try { color = Color.parseColor(call.getString("color", "#3b5bdb")); } catch (Exception e) { color = Color.parseColor("#3b5bdb"); }
+              if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) { call.reject("unsupported"); return; }
+              Context c = getContext();
+              ShortcutManager m = c.getSystemService(ShortcutManager.class);
+              if (m == null || !m.isRequestPinShortcutSupported()) { call.reject("unsupported"); return; }
+              Intent i = new Intent(c, MainActivity.class);
+              i.setAction(Intent.ACTION_VIEW);
+              i.putExtra("najmaNote", id);
+              i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+              Bitmap b = Bitmap.createBitmap(192, 192, Bitmap.Config.ARGB_8888);
+              Canvas cv = new Canvas(b);
+              Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+              p.setColor(color);
+              cv.drawRoundRect(new RectF(0, 0, 192, 192), 44, 44, p);
+              TextPaint tp = new TextPaint(Paint.ANTI_ALIAS_FLAG);
+              tp.setColor(Color.WHITE);
+              tp.setFakeBoldText(true);
+              StaticLayout sl = null;
+              for (float sz = 60; sz >= 16; sz -= 4) {
+                tp.setTextSize(sz);
+                sl = StaticLayout.Builder.obtain(title, 0, title.length(), tp, 160)
+                  .setAlignment(Layout.Alignment.ALIGN_CENTER).build();
+                if (sl.getHeight() <= 164) break;
+              }
+              cv.save();
+              cv.translate(16, (192 - sl.getHeight()) / 2f);
+              sl.draw(cv);
+              cv.restore();
+              Icon coverIcon = null;
+              String iconB64 = call.getString("icon", null);
+              if (iconB64 != null && !iconB64.isEmpty()) {
+                try {
+                  byte[] raw = android.util.Base64.decode(iconB64, android.util.Base64.DEFAULT);
+                  Bitmap cb = android.graphics.BitmapFactory.decodeByteArray(raw, 0, raw.length);
+                  if (cb != null) coverIcon = Icon.createWithAdaptiveBitmap(cb);
+                } catch (Exception ex) { coverIcon = null; }
+              }
+              ShortcutInfo s = new ShortcutInfo.Builder(c, "note-" + id)
+                .setShortLabel(title).setLongLabel(title)
+                .setIcon(coverIcon != null ? coverIcon : Icon.createWithBitmap(b)).setIntent(i).build();
+              m.requestPinShortcut(s, null);
+              call.resolve();
+            }
+
+            @PluginMethod
+            public void getLaunch(PluginCall call) {
+              Intent i = getActivity().getIntent();
+              JSObject r = new JSObject();
+              String id = i == null ? null : i.getStringExtra("najmaNote");
+              if (id != null) { r.put("id", id); i.removeExtra("najmaNote"); }
+              call.resolve(r);
+            }
+          }
+          JAVA_EOF
+          cat > "$D/MainActivity.java" <<'JAVA_EOF'
+          package com.najma.notes;
+
+          import android.content.Intent;
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+            @Override
+            public void onCreate(Bundle savedInstanceState) {
+              registerPlugin(ShortcutPlugin.class);
+              super.onCreate(savedInstanceState);
+            }
+
+            @Override
+            protected void onNewIntent(Intent intent) {
+              super.onNewIntent(intent);
+              setIntent(intent);
+              String id = intent.getStringExtra("najmaNote");
+              if (id != null) {
+                intent.removeExtra("najmaNote");
+                getBridge().triggerWindowJSEvent("najmaOpen", "{\"id\":\"" + id + "\"}");
+              }
+            }
+          }
+          JAVA_EOF
+
+      - name: Storage permission (save exported .najma files to Documents)
+        run: |
+          M=android/app/src/main/AndroidManifest.xml
+          grep -q "WRITE_EXTERNAL_STORAGE" "$M" || sed -i 's#<application#<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />\n    <application#' "$M"
+          grep -n "uses-permission" "$M"
+
+      - name: Fixed signing key and version (so new APK updates the installed one)
+        run: |
+          mkdir -p ~/.android
+          echo "MIIKZgIBAzCCChAGCSqGSIb3DQEHAaCCCgEEggn9MIIJ+TCCBcAGCSqGSIb3DQEHAaCCBbEEggWtMIIFqTCCBaUGCyqGSIb3DQEMCgECoIIFQDCCBTwwZgYJKoZIhvcNAQUNMFkwOAYJKoZIhvcNAQUMMCsEFOHHjFwUQlIAcyvQWLNxhxWYKHQ9AgInEAIBIDAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBKgQQOxQ8UO2hpJA7mTLe+5VFmASCBNAU0yF7tfcENNLSe62EZuguZMiS9K79gmLyS5XxS15pSaduUZKvAmdWX8TLDAPNhksSdrsfUGFtTtEzVnLSXRIjcc73rexL5fT5yOUESmChiac10+DQ0F/RlcQkcgVpkXJP0c4z8RNhH2FJui3ASnJ1jSueF4c06OUs6FoCVuB50O1YGXsXwgu7rBuW1l1dqpwJbCopgYe55ERFeXVeWzqNZb1BES7Cz/kklXHLOQDhGEovxh/1+8kL/xAr8t4vQwL+7Xe5unE4AsDIK/ERHiLW/J7QPI0OEfv+9tyKuwj6NebbsPUhIZdOuhCd6OVBTc3lNRwdkak85mx6e+yJVl6qJY2GlBKerHE2bp4ZuFCtNbdHFLRJHw52BIaXuaqvYo3KJTJk0tnAHqzgBhsJjaV8JS0HHb3+1fRlQ1H6u7vswTp3nQy2eaQA7Lq94BlCIpAXoZKNVa84eeGyWdd6e9RgJ2YjXfK5CdPyKlMSARCQ/tfRxcO9IJ/3i3JMQqHfSqdG7EsOvFHQIbm3365Beu8CGUIjG78zyG2n/pp6svzhqK3Nxaonqc63ZdPv1u3L0hPedEW9PhNRYnBf2J1qpJ2AW3tz/bVtI7Fp2Cg/q79HKPf7niys4gRn3T6CVJ8eo+RzkYqnUS4gRxbx4KPMlAsTG+d/1XeGaCfoSTqmdUYrrb0SbWcwyyaSX252qF0EaBx5kh9jv81Gy57iG91e1WAJt8YeIsrWA/oNHsKDbDfoknhjK5RGSnrWoq9C1+n0wdDeRCwHhXX8BXvnWFD7u3Nf+VAFQ1Nb7xYuEXN8QT0xva8TB66knwN6bXpITr6G4/bRN8x5TIDk+8cpManFrarRDX3pUiMtKTQDTKh6KGgMxOroXmLYF0jp2prqk9ie8IvFrxAhq87FZ2DA2MXa7WW6d+tgBRo1AYNMDFsU9tPvLw1ldB9CY/FpkRHlMPx1pKzVX01g3bHwb4MqMeZBdxYmyOETWqY3AxxDESdjrxPuYeGmhfq1w217N0OiAwmE7KxlPRg0aVwecjOE/fWwc5m4bxnsbvwCj54ZoBp6G0aqrQ52Az36h0W6cj9Lej+a8ieu4kq2MLfA2hS8oZm48igzzU+atmxawu+3B/NgicOZfV0ZU3PqnAR5f0I7cgafHeMkq9kysCgGNS20yVdqgLu1P1Unb9TAsuXOx9GPgyyZWJcxSVd5b/79n09uiij5mUPiheOPLlyw2p1iERuS0KOaYf2gBta9uMKUsYh+YmTOGWEc6iuxoqbGmSxb4r7+O2xzlr/Fqt75W5xpvArWonZ1cxYR/TQDsadXA8EZiw2d4RE3RCGKfMEOHmcGeVQHlbOOfisWR0NMGr/1iZpxv6OkkQ+WKxzRihnKw76g/u2oxhUrd8Gg477bdIqmKhGu1CbM+uUV/sCkBngNMpWm2WaDCS84XQhSK9yq6ioQOoJ41rLOCFofObPf2Lu6B14RBt5QF7X5XDI1K8A+jAgvliQmp5yhqva3RsPfNNtXfJ3Y8nnZuhnv9MrcA5m1/4idaPhBppzugnsydtrtljpC55UYrwbXsYIBPLHW42WbRz5u2MfuNO5YB6tvdFQok1I+7juZwJjpdkHzmAT9bESbfgiO2GoSAKU0Tour5+ivAhAfxzFSMC0GCSqGSIb3DQEJFDEgHh4AYQBuAGQAcgBvAGkAZABkAGUAYgB1AGcAawBlAHkwIQYJKoZIhvcNAQkVMRQEElRpbWUgMTc5MjE4NTI5MDc1NTCCBDEGCSqGSIb3DQEHBqCCBCIwggQeAgEAMIIEFwYJKoZIhvcNAQcBMGYGCSqGSIb3DQEFDTBZMDgGCSqGSIb3DQEFDDArBBT184DcnVfUvcfwJ4VzrZKBCEIrywICJxACASAwDAYIKoZIhvcNAgkFADAdBglghkgBZQMEASoEEPJbaI8nH2SpYJ9ht7zpRq+AggOgmG+EfoTE2VJ5Tw/USpcowMzof4tzW8k+e1zItAE6TmWO5GgqVGX0rO2a1kDdFuWFJFAueXDGYMSe/vhJNl+NZdjVikz8sgk7WmhqGse8cZnO+bRRSElB7xhP52rppkhRTiujZi0CCryZTh4VvhcnT9bCW8lK2KZCOD4JBOYuPG/gLjuwSYee2LzWsTDLjvT4+MT+/HtaT3zDHJh5jBeSbk3wD5YY6p4D27bKmoPQ9whrycSAt63Ih76ri3HSmvwpBsJNHbLVFg3JWvoLVs2kDTgSSdw7opoKtaF+dIq/XjqJ9nJC4tuactoo4LTv+LNWEvrEWdDUBvFNIAxlWoQj1XTvJ0r13OEyGQss+9xW8LtWIaubq2A9IMnHNj7G1fWgRaPSlDlM+BU/x5J5sUxbVIT4fm3O8WhbrHagBsdj/CoZajnO3yVQPEl72xPcS6x8FvcXN35/jzWROZPHs7ixQ5OFvnNom8Av+zomK7kako+mYxcfNo0Os3sC/0QCv1Ah+fJzLfAKd7pj9SnSjA/y4EHM8RzYGqvx7eetyWEXzb5RYlI2LhDZGGjnOqIrxloO8MCc/CFDt6Ce878H+hHNv0FmL8rg/mtNk3cwoHSSffl1ySd8WJHljgnUsHMcRX5jZS6QwWAs6l4FCcJWFNjmBJf9mshZJ5PecLpcHFhcpOVm85PIwhNfwJ8lXLwA6mJMnbnxPYKLr4QkPM40SW6nusrUeDEmFl+aVn+UcogmVgXxoZLhlpoQJUXk1UNisXtzbpI5PtwtFr/f8ufy0wyZXWAkEsKEyfiOgxlNkEG9TF8N+Od1OVpQ0Pk06wBDeAvgBzkh5oGI7rvqPaixoaStSvnUwEihvOLoXXRrc7DwVlqa0fXauc6HIT8IzKMM2nAUXHDgtcYL032V4u6JfGKvu5LHbgykd/BlmDfTwlKwBb9qDfO5ykH2GtRO2IMU3jXobGlKcSq78WhfH8YFraem4yzdA6TVYSnw1/ZXTGxUj7QN/HBpGiJS027AyEDhyzbQcvqegOranY59o5Q1QGwxs0XNlRalBAHf6ay8SWEzktVkrr6JoayYODubiZaupQ2mJ9mJlt+S1/dfeEtmM1MHMm52+aTvphUW3AMkcfparmJ1JV5dmW+1JSJZw2X0zyMclQ9r+KkizYRRVdwp/HlBFa8lSR0ywmJDd5asBb98nBH/jXvwc92QjmXG3J8uM43zj+IlheRuBREEuEPHBtIitjBNMDEwDQYJYIZIAWUDBAIBBQAEILMawGBZt6ZmrKGdSNj+lto9i+k6G7ZOuJmJVrUKKZCMBBRg0xx3XF0vph6ZmIYXpU0JjG0BIQICJxA=" | base64 -d > ~/.android/debug.keystore
+          VC=$((1000 + ${{ github.run_number }}))
+          G=android/app/build.gradle
+          sed -i -E "s/versionCode [0-9]+/versionCode $VC/" "$G"
+          sed -i -E "s/versionName \"[^\"]*\"/versionName \"1.$VC\"/" "$G"
+          grep -nE "versionCode|versionName" "$G"
+
+      - name: Build debug APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Upload APK as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: najma-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publish APK in Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Najma v${{ github.run_number }}
+          files: android/app/build/outputs/apk/debug/app-debug.apk
